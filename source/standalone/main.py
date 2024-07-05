@@ -29,8 +29,12 @@ from omni.isaac.lab.managers import SceneEntityCfg
 from omni.isaac.lab.markers import VisualizationMarkers
 from omni.isaac.lab.markers.config import FRAME_MARKER_CFG
 from omni.isaac.lab_assets import FRANKA_PANDA_HIGH_PD_CFG
-from omni.isaac.lab.utils.math import subtract_frame_transforms
-
+from omni.isaac.lab.sensors.camera import Camera, CameraCfg
+from omni.isaac.lab.sensors.camera.utils import create_pointcloud_from_depth
+from m2t2_utils import save_data
+import sys
+sys.path.append('/home/jacob/projects/cleandakitchen/M2T2')
+from demo import load_and_predict
 from planner import MotionPlanner
 
 @configclass
@@ -69,25 +73,27 @@ class TableTopSceneCfg(InteractiveSceneCfg):
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.25, 0.3, 1.2))
     )
-    # cube_two = RigidObjectCfg(
-    #     prim_path="{ENV_REGEX_NS}/Cube2",
-    #     spawn=sim_utils.CuboidCfg(
-    #         size=(0.2, 0.2, 0.2),
-    #         rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-    #         mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-    #         collision_props=sim_utils.CollisionPropertiesCfg()
-    #     ),
-    #     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.25, -0.3, 0.25))
-    # )
 
     # articulation
     robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     robot.init_state.pos = (0.0, 0.0, 1.05)
 
+    # camera
+    camera = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/CameraSensor",
+        update_period=0,
+        height=480,
+        width=640,
+        data_types=["rgb", "distance_to_image_plane", "semantic_segmentation"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.1, 1.0e5)
+        ),
+    )
+
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     robot = scene["robot"]
-
-    #controller
+    camera = scene["camera"]
+    # Controller
     diff_ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls")
     diff_ik_controller = DifferentialIKController(diff_ik_cfg, num_envs=scene.num_envs, device=sim.device)
     
@@ -124,14 +130,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     sim_dt = sim.get_physics_dt()
     # Define simulation stepping
     count = 0
+    # Saving pointcloud info
+    frame = 0
+    output_dir = 'output_data'
     # Simulation loop
-    goals = [
-        # [0.5, -0.5, 0.5, 0.707, 0, 0.707, 0],
-        [0.5, -0.5, 0.7, 0.707, 0, 0.707, 0],
-        [0.5, 0.5, 0.7, 0.707, 0, 0.707, 0],
-    ]
     planner = MotionPlanner(scene, sim.device)
-    goal_idx = None
     goal = None
     plan = None
     #reset
@@ -149,119 +152,50 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     diff_ik_controller.set_command(ik_commands)
 
     while simulation_app.is_running():
-        # reset
-        # if count % 150 == 0:
-            # reset time
-        # else:
-            # # obtain quantities from simulation
-            # jacobian = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, robot_entity_cfg.joint_ids]
-            # ee_pose_w = robot.data.body_state_w[:, robot_entity_cfg.body_ids[0], 0:7]
-            # root_pose_w = robot.data.root_state_w[:, 0:7]
-            # joint_pos = robot.data.joint_pos[:, robot_entity_cfg.joint_ids]
-            # # compute frame in root frame
-            # ee_pos_b, ee_quat_b = subtract_frame_transforms(
-            #     root_pose_w[:, 0:3], root_pose_w[:, 3:7], ee_pose_w[:, 0:3], ee_pose_w[:, 3:7]
-            # )
-            # # compute the joint commands
-            # joint_pos_des = diff_ik_controller.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
-        # if count % 500 == 0:
-            # switch goal
-        # goal_idx = 0 if goal_idx and goal_idx != 0 else 1
-        # goal = np.array(goals[goal_idx])
-        block = scene["cube_one"].data.root_pos_w - robot.data.root_pos_w
-        quat = torch.tensor([[0, 0.707,0.707,0]], device=sim.device)
-        # breakpoint()
-        goal = torch.cat([block, quat], dim=1)
+        camera.update(dt = sim_dt)
+        # doesn't actually take in pointcloud, instead it needs the corresponding files.
+        save_data(camera, output_dir, frame)
+        import hydra
+        from omegaconf import OmegaConf
+        cfg = OmegaConf.load("/home/jacob/projects/cleandakitchen/M2T2/config.yaml")
+        data_dir = output_dir
+        data, outputs = load_and_predict(data_dir, cfg) # data is used to determine pick and place, visualization, etc
 
-        joint_pos = robot.data.joint_pos[:, robot_entity_cfg.joint_ids]
-        joint_vel = robot.data.joint_vel[:, robot_entity_cfg.joint_ids]
-        joint_names = robot.data.joint_names
-        plan = planner.plan(joint_pos, joint_vel, joint_names, goal.squeeze())
-        # print("NEW PLAN!")
-        # print(plan.position)
-        for joint_pos in plan.position:
-            for j in range(20):
-                robot.set_joint_position_target(joint_pos, joint_ids=robot_entity_cfg.joint_ids)
-                scene.write_data_to_sim()
-                # perform step
-                sim.step()
-                # update sim-time
-                count += 1
-                # update buffers
-                scene.update(sim_dt)
+        frame += 1
+        if outputs and 'grasps' in outputs:
+            grasping_point = outputs['grasps'][0][0]
+            grasping_orientation = outputs['grasps'][0][3:]
 
-                ee_pose_w = robot.data.body_state_w[:, robot_entity_cfg.body_ids[0], 0:7]
-                ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
-                goal_marker.visualize(goal[:, 0:3], goal[:, 3:7])
+            goal = torch.tensor([grasping_point[0], grasping_point[1], grasping_point[2], grasping_orientation[0], grasping_orientation[1], grasping_orientation[2], grasping_orientation[3]], device=sim.device)
 
+            joint_pos = robot.data.joint_pos[:, robot_entity_cfg.joint_ids]
+            joint_vel = robot.data.joint_vel[:, robot_entity_cfg.joint_ids]
+            joint_names = robot.data.joint_names
 
-        while(True):
-            robot.set_joint_position_target(joint_pos, joint_ids=robot_entity_cfg.joint_ids)
-            scene.write_data_to_sim()
-            # perform step
-            sim.step()
-            # update sim-time
-            count += 1
-            # update buffers
-            scene.update(sim_dt)
-
-            ee_pose_w = robot.data.body_state_w[:, robot_entity_cfg.body_ids[0], 0:7]
-            ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
-            goal_marker.visualize(goal[:, 0:3], goal[:, 3:7])
-
-
-
-
-        # # else:
-            
-        # for joint_pos in traj.position:
-            
-        #     joint_pos_des = joint_pos
-                
-        #     for i in range(5):
-        #         # apply actions
-        #         robot.set_joint_position_target(joint_pos_des, joint_ids=robot_entity_cfg.joint_ids)
-        #         scene.write_data_to_sim()
-        #         # perform step
-        #         sim.step()
-        #         # update sim-time
-        #         count += 1
-        #         # update buffers
-        #         scene.update(sim_dt)
-
-        #         # obtain quantities from simulation
-        #         ee_pose_w = robot.data.body_state_w[:, robot_entity_cfg.body_ids[0], 0:7]
-        #         # update marker positions
-        #         ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
-        #         goal_marker.visualize(ik_commands[:, 0:3] , ik_commands[:, 3:7])
-        
-
-
+            plan = planner.plan(joint_pos, joint_vel, joint_names, goal.squeeze())
+            for joint_pos in plan.position:
+                for j in range(20):
+                    robot.set_joint_position_target(joint_pos, joint_ids=robot_entity_cfg.joint_ids)
+                    scene.write_data_to_sim()
+                    sim.step()
+                    count += 1
+                    scene.update(sim_dt)
+                    ee_pose_w = robot.data.body_state_w[:, robot_entity_cfg.body_ids[0], 0:7]
+                    ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
+                    goal_marker.visualize(goal[:, 0:3], goal[:, 3:7])
 
 def main():
-    # sim_cfg = sim_utils.SimulationCfg(dt=0.01)
-    # sim = sim_utils.SimulationContext(sim_cfg)
+    sim_cfg = sim_utils.SimulationCfg(dt=0.01)
+    sim = sim_utils.SimulationContext(sim_cfg)
 
-    # scene_cfg = TableTopSceneCfg(num_envs=1, env_spacing=2.0)
-    # scene = InteractiveScene(scene_cfg)
+    scene_cfg = TableTopSceneCfg(num_envs=1, env_spacing=2.0)
+    scene = InteractiveScene(scene_cfg)
     # Play the simulator
-    # sim.reset()
-    # # Now we are ready!
-    # print("[INFO]: Setup complete...")
-    # # Run the simulator
-    # run_simulator(sim, scene)
-
-     # create environment configuration
-    env_cfg = parse_env_cfg(
-        "Isaac-Lift-Cube-Franka-IK-Rel-v0", use_gpu=True, num_envs=2, use_fabric=False
-    )
-    # create environment
-    env = gym.make("Isaac-Lift-Cube-Franka-IK-Rel-v0", cfg=env_cfg)
-
-    print(env.action_space)
-
-    env.reset()
-
+    sim.reset()
+    # Now we are ready!
+    print("[INFO]: Setup complete...")
+    # Run the simulator
+    run_simulator(sim, scene)
 
 if __name__ == "__main__":
     # run the main function
